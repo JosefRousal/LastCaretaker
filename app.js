@@ -614,16 +614,21 @@ function buildHumanTable() {
     inp.addEventListener('change', () => {
       humans[parseInt(inp.dataset.index)].profession = inp.value.trim();
       rebuildDropdown();
+      renderBatchSlots(); // refresh batch slot <option> labels — indices are unaffected by a rename
     });
   });
   wrap.querySelectorAll('input[data-field="category"]').forEach(inp => {
     inp.addEventListener('change', () => {
       humans[parseInt(inp.dataset.index)].category = inp.value.trim();
       rebuildDropdown();
+      renderBatchSlots();
     });
   });
   wrap.querySelectorAll('.btn-del-row[data-type="human"]').forEach(btn => {
     btn.addEventListener('click', () => {
+      // Batch slots freeze a professionIndex for the whole run; deleting a row while
+      // that run is in flight would desync/invalidate those indices mid-search.
+      if (batchRunning) { showToast('Finish or cancel the batch solve first'); return; }
       humans.splice(parseInt(btn.dataset.index), 1);
       buildHumanTable(); rebuildDropdown(); clearBatchSelections();
     });
@@ -781,6 +786,7 @@ function addMemory() {
 function addHuman() {
   humans.push({ profession: 'New Profession', category: 'Custom', stats: new Array(15).fill(0) });
   buildHumanTable(); rebuildDropdown();
+  renderBatchSlots(); // an append doesn't shift existing indices — just refresh the option list
 }
 
 // ─── CSV Download ────────────────────────────────────────────────────────────
@@ -874,6 +880,9 @@ function uploadMemoriesCSV(text) {
 }
 
 function uploadHumansCSV(text) {
+  // Batch slots freeze professionIndex values for the whole run; reloading humans[]
+  // while that run is in flight would desync/invalidate those indices mid-search.
+  if (batchRunning) { showToast('Finish or cancel the batch solve first'); return; }
   const csv = parseCSV(text);
   humans = csv.rows.map(r => ({
     profession: normalize(r['Profession'] || ''),
@@ -964,6 +973,11 @@ function buildItems() {
 // once the solve fully finishes (via finishSolve) — callers that don't need this
 // (the Solve button, Enter key) simply ignore the returned promise, unchanged from before.
 function startSolve(consumedMap) {
+  // Re-entrancy guard: a second concurrent call would stomp the shared solve-session
+  // globals (workers, _solveCompletionResolve, items, ...) out from under whichever
+  // call is already in flight — this can otherwise happen if the plain Solve button
+  // is reachable while a batch run's per-human solve is still active.
+  if (solving) return;
   if (currentTarget === null) return;
   const target = humans[currentTarget];
 
@@ -1138,7 +1152,10 @@ function startSolve(consumedMap) {
     workersDone = 0;
     workersExhaustive = 0;
     document.getElementById('solve-btn').classList.add('hidden');
-    document.getElementById('cancel-btn').classList.remove('hidden');
+    // In batch mode "Cancel Batch" is the only cancel affordance — the plain Cancel
+    // button only stops the current slot without telling the batch loop, which would
+    // silently fold a cut-short recipe into the combined list. Keep it out of reach.
+    if (!batchMode) document.getElementById('cancel-btn').classList.remove('hidden');
     document.getElementById('pause-btn').classList.remove('hidden');
     document.getElementById('pause-btn').textContent = 'Pause';
     document.getElementById('progress-card').classList.remove('hidden');
@@ -1275,7 +1292,9 @@ function finishSolve() {
   clearInterval(solveTimer);
   workers.forEach(w => w.terminate());
   workers = [];
-  document.getElementById('solve-btn').classList.remove('hidden');
+  // In batch mode "Solve Batch" is the equivalent of this button — never show the
+  // single-target one while a batch run owns the current solve.
+  document.getElementById('solve-btn').classList.toggle('hidden', batchMode);
   document.getElementById('cancel-btn').classList.add('hidden');
   document.getElementById('pause-btn').classList.add('hidden');
 
@@ -1554,17 +1573,21 @@ function displayResults(elapsed, scroll) {
 
   body.innerHTML = html;
 
-  // Show apply button if inventory is limited
+  // Show apply button if inventory is limited. Never during batch mode — Apply Batch
+  // is the correct control for the combined total; this single-target button would
+  // apply only the current slot's items and, if left reachable while later slots are
+  // still solving, double-subtract once Apply Batch also runs.
   const applyWrap = document.getElementById('apply-solution-wrap');
   const unlimited = document.getElementById('unlimited-check').checked;
-  if (!unlimited && globalBest) {
+  if (!unlimited && globalBest && !batchMode) {
     applyWrap.classList.remove('hidden');
   } else {
     applyWrap.classList.add('hidden');
   }
 
-  // Scroll to results (only on explicit request, e.g. final results)
-  if (scroll) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  // Scroll to results (only on explicit request, e.g. final results) — suppressed in
+  // batch mode so the view doesn't keep jumping away from the batch progress/results.
+  if (scroll && !batchMode) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
   // Update solution navigation header
   updateSolutionNav();
@@ -1788,7 +1811,7 @@ function renderBatchSlotStatuses() {
     const pill = document.querySelector(`.batch-slot[data-slot="${entry.slotIndex}"] .batch-slot-status`);
     if (!pill) return;
     pill.dataset.status = entry.status;
-    pill.textContent = labels[entry.status] || '';
+    pill.textContent = entry.status === 'solved' && entry.cutShort ? '✓ Solved (cut short)' : (labels[entry.status] || '');
   });
 }
 
@@ -1807,48 +1830,63 @@ async function startBatchSolve() {
   renderBatchSlotStatuses();
 
   const savedCurrentTarget = currentTarget;
+  // Lock out anything that could invalidate a frozen professionIndex or start a
+  // second concurrent solve while this run is in flight.
+  document.getElementById('batch-mode-check').disabled = true;
+  document.getElementById('batch-count-input').disabled = true;
   document.getElementById('batch-solve-btn').classList.add('hidden');
   document.getElementById('batch-cancel-btn').classList.remove('hidden');
   document.getElementById('batch-results-card').classList.add('hidden');
   const progressLabel = document.getElementById('batch-progress-label');
   progressLabel.classList.remove('hidden');
 
-  for (let n = 0; n < batchResultsData.length; n++) {
-    const entry = batchResultsData[n];
-    if (batchCancelRequested) { entry.status = 'cancelled'; renderBatchSlotStatuses(); continue; }
-    entry.status = 'solving';
-    renderBatchSlotStatuses();
-    const h = humans[entry.professionIndex];
-    progressLabel.textContent = `Solving Human ${entry.slotIndex + 1} of ${batchCount} — ${h.profession}…`;
-    currentTarget = entry.professionIndex;
+  try {
+    for (let n = 0; n < batchResultsData.length; n++) {
+      const entry = batchResultsData[n];
+      if (batchCancelRequested) { entry.status = 'cancelled'; renderBatchSlotStatuses(); continue; }
+      entry.status = 'solving';
+      renderBatchSlotStatuses();
+      const h = humans[entry.professionIndex];
+      progressLabel.textContent = `Solving Human ${entry.slotIndex + 1} of ${batchCount} — ${h.profession}…`;
+      currentTarget = entry.professionIndex;
 
-    const result = await startSolve(batchConsumed);
-    // startSolve()/finishSolve() reuse the single-target UI (progress card, results
-    // card, solve/apply buttons) — force them back into "batch is driving" state
-    // after every slot so they don't leak into view between/after solves.
-    document.getElementById('solve-btn').classList.add('hidden');
-    document.getElementById('apply-solution-wrap').classList.add('hidden');
+      const result = await startSolve(batchConsumed);
 
-    if (!result || !result.solution) {
-      entry.status = 'infeasible';
-    } else {
-      entry.status = 'solved';
-      entry.html = document.getElementById('results-body').innerHTML;
-      result.solution.items.forEach(idx => {
-        const it = result.itemsSnapshot[idx];
-        const key = `${it.kind}:${it.name}`;
-        if (!batchConsumed[key]) batchConsumed[key] = { kind: it.kind, name: it.name, count: 0 };
-        batchConsumed[key].count++;
-      });
+      if (!result || !result.solution) {
+        entry.status = batchCancelRequested ? 'cancelled' : 'infeasible';
+      } else {
+        entry.status = 'solved';
+        // Cancel Batch can land while this exact slot was mid-search — its result is
+        // real and usable but wasn't given the full search, so flag it as such rather
+        // than presenting it identically to a normally-completed slot.
+        entry.cutShort = batchCancelRequested;
+        entry.html = document.getElementById('results-body').innerHTML;
+        result.solution.items.forEach(idx => {
+          const it = result.itemsSnapshot[idx];
+          const key = `${it.kind}:${it.name}`;
+          if (!batchConsumed[key]) batchConsumed[key] = { kind: it.kind, name: it.name, count: 0 };
+          batchConsumed[key].count++;
+        });
+      }
+      renderBatchSlotStatuses();
     }
-    renderBatchSlotStatuses();
+  } finally {
+    // Guaranteed cleanup even if something above throws (e.g. an unexpected DOM/state
+    // issue) — otherwise batchRunning would stay stuck true and permanently block
+    // every future batch run.
+    currentTarget = savedCurrentTarget;
+    batchRunning = false;
+    document.getElementById('batch-mode-check').disabled = false;
+    document.getElementById('batch-count-input').disabled = false;
+    document.getElementById('batch-solve-btn').classList.remove('hidden');
+    document.getElementById('batch-cancel-btn').classList.add('hidden');
+    progressLabel.classList.add('hidden');
+    // The last slot's individual result (rendered via the shared single-target
+    // panel) has already been captured into entry.html — hide the panel itself so
+    // it doesn't linger alongside the combined batch results below.
+    document.getElementById('results-card').classList.add('hidden');
+    document.getElementById('progress-card').classList.add('hidden');
   }
-
-  currentTarget = savedCurrentTarget;
-  batchRunning = false;
-  document.getElementById('batch-solve-btn').classList.remove('hidden');
-  document.getElementById('batch-cancel-btn').classList.add('hidden');
-  progressLabel.classList.add('hidden');
   renderBatchResults();
 }
 
@@ -1863,8 +1901,18 @@ function renderBatchResults() {
 
   const combined = Object.values(batchConsumed).map(c => {
     const list = c.kind === 'Food' ? foods : memories;
-    const item = list.find(x => x.name === c.name);
-    return { name: c.name, kind: c.kind, count: c.count, availability: item ? (item.availability || 0) : 0 };
+    const datakind = c.kind === 'Food' ? 'food' : 'memory';
+    const idx = list.findIndex(x => x.name === c.name);
+    const item = idx >= 0 ? list[idx] : null;
+    // Annotate the same way displayResults() does so recipeItemHTML() doesn't
+    // silently drop the stat tooltip / Inventory-Eco percentage for this view.
+    const v = idx >= 0 ? getInvValue(datakind, idx) : 9999;
+    return {
+      name: c.name, kind: c.kind, count: c.count,
+      availability: item ? (item.availability || 0) : 0,
+      stats: item ? item.stats : null,
+      invCount: v >= 9999 ? null : v,
+    };
   });
   const foodItems = combined.filter(c => c.kind === 'Food').sort((a, b) => a.name.localeCompare(b.name));
   const memItems = combined.filter(c => c.kind === 'Memory').sort((a, b) => a.name.localeCompare(b.name));
@@ -1895,9 +1943,10 @@ function renderBatchResults() {
   batchResultsData.forEach(entry => {
     const h = humans[entry.professionIndex];
     const statusLabel = entry.status === 'infeasible' ? ' — No solution found'
-      : entry.status === 'cancelled' ? ' — Cancelled' : '';
+      : entry.status === 'cancelled' ? ' — Cancelled'
+      : entry.cutShort ? ' — Cancelled mid-search (partial result)' : '';
     perHumanHtml += `<div class="batch-result-item">
-      <button class="batch-result-toggle" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+      <button class="batch-result-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('collapsed')">
         <span class="avoidable-toggle-icon">▶</span> Human ${entry.slotIndex + 1} &mdash; ${esc(h.profession)}${statusLabel}
       </button>
       <div class="batch-result-body collapsed">${entry.html || ''}</div>
@@ -1918,8 +1967,14 @@ function applyBatchSolution() {
     if (idx < 0) continue;
     const inp = document.querySelector(`.inv-item-input[data-kind="${datakind}"][data-index="${idx}"]`);
     if (!inp) continue;
-    const cur = inp.value === '' ? (list[idx].availability || 0) : (parseInt(inp.value) || 0);
-    inp.value = String(Math.max(0, cur - c.count));
+    // Mirror getResourceLimits()'s exact per-item cap formula so we subtract from the
+    // same number the solver actually treated as available, rather than a separately
+    // -invented "current stock" guess that could disagree with it (e.g. for a blank
+    // box, or a memory with no recorded WorldCount while unlimited mode is on).
+    const cap = c.kind === 'Food'
+      ? (unlimited ? 9999 : getInvValue('food', idx))
+      : (unlimited ? (list[idx].availability || 9999) : getInvValue('memory', idx));
+    inp.value = String(Math.max(0, cap - c.count));
   }
   document.getElementById('batch-apply-wrap').classList.add('hidden');
   persistInventory();

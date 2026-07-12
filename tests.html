@@ -2351,6 +2351,22 @@
       assertEqual([humanA, humanB].length, 2, 'duplicate profession picks still produce two separate result entries, never deduped');
     }
 
+    section('Batch apply baseline — matches the solver\'s own per-item cap, not a separately-invented "current stock"');
+    {
+      // Mirrors applyBatchSolution()'s `cap` formula (app.js) — it must equal
+      // getResourceLimits()'s per-item cap exactly, since that's the number the
+      // solver actually treated as available. The pre-fix version instead did
+      // `inp.value === '' ? (item.availability || 0) : parseInt(inp.value)`, which
+      // disagreed with the solve-time cap in exactly the cases asserted below.
+      function applyCapRef(kind, unlimited, invValue, worldCount) {
+        return kind === 'food' ? (unlimited ? 9999 : invValue) : (unlimited ? (worldCount || 9999) : invValue);
+      }
+      assertEqual(applyCapRef('memory', true, 0, 0), 9999, 'unlimited memory with no recorded world count: apply baseline is 9999 (matches solve-time cap), not 0');
+      assertEqual(applyCapRef('memory', true, 0, 30), 30, 'unlimited memory: apply baseline is the world count, matching the solve-time cap');
+      assertEqual(applyCapRef('food', false, 9999, 0), 9999, 'limited food with a blank box: apply baseline is 9999 (getInvValue\'s unlimited sentinel), matching the solve-time cap');
+      assertEqual(applyCapRef('food', true, 5, 0), 9999, 'unlimited food ignores any stray/stale inventory-box value — always the solve-time 9999 cap');
+    }
+
     // Fallback: show summary if all tests were synchronous (no asyncBegin calls)
     setTimeout(() => { if (asyncPending <= 0) showSummary(); }, 100);  </script>
 </body>
