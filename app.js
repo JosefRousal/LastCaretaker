@@ -51,6 +51,16 @@ let cancelledByUser = false;
 let allSolutions = [];
 let solutionIndex = 0;
 let userBrowsingSolutions = false;
+let _solveCompletionResolve = null; // resolves the promise startSolve() returns, once finishSolve() runs
+
+// ─── Batch Mode State ────────────────────────────────────────────────────────
+let batchMode = false;
+let batchCount = 4;
+let batchProfessions = []; // professionIndex|null, one per slot
+let batchRunning = false;
+let batchCancelRequested = false;
+let batchConsumed = {};     // `${kind}:${name}` -> {kind, name, count} used so far this batch run
+let batchResultsData = [];  // [{slotIndex, professionIndex, status, html}]
 
 // ─── CSV Parsing ─────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -167,8 +177,9 @@ async function loadData() {
 }
 
 // ─── UI: Profession Dropdown ─────────────────────────────────────────────────
-function populateDropdown() {
-  const sel = document.getElementById('profession-select');
+// Appends one <optgroup> per category with an <option> per profession — shared by
+// the hidden single-target <select> and each batch-mode slot's <select>.
+function buildProfessionOptionsInto(selectEl) {
   const cats = {};
   humans.forEach((h, i) => {
     if (!cats[h.category]) cats[h.category] = [];
@@ -183,8 +194,12 @@ function populateDropdown() {
       opt.textContent = h.profession;
       grp.appendChild(opt);
     }
-    sel.appendChild(grp);
+    selectEl.appendChild(grp);
   }
+}
+
+function populateDropdown() {
+  buildProfessionOptionsInto(document.getElementById('profession-select'));
 }
 
 function onProfessionChange() {
@@ -341,14 +356,32 @@ function buildItemGrid(containerId, itemList, kind) {
   });
 }
 
-function getResourceLimits() {
+// consumedMap (optional): `${kind}:${name}` -> {kind, name, count} already used by
+// earlier humans in the current batch run. Memories are always shared/decremented
+// (they're finite collectibles regardless of the unlimited toggle); food is only
+// decremented when NOT unlimited, since unlimited food is freely craftable.
+function getResourceLimits(consumedMap) {
   const unlimited = document.getElementById('unlimited-check').checked;
   const limits = { foods: [], memories: [] };
   // Unlimited mode: food is freely craftable (truly unlimited), but memories are
   // finite collectibles — cap each at its world maximum (WorldCount). A memory with
   // no recorded world count (0) falls back to unlimited rather than being excluded.
-  foods.forEach((_, i) => limits.foods.push(unlimited ? 9999 : getInvValue('food', i)));
-  memories.forEach((m, i) => limits.memories.push(unlimited ? (m.availability || 9999) : getInvValue('memory', i)));
+  foods.forEach((f, i) => {
+    let cap = unlimited ? 9999 : getInvValue('food', i);
+    if (consumedMap && !unlimited) {
+      const c = consumedMap[`Food:${f.name}`];
+      if (c) cap = Math.max(0, cap - c.count);
+    }
+    limits.foods.push(cap);
+  });
+  memories.forEach((m, i) => {
+    let cap = unlimited ? (m.availability || 9999) : getInvValue('memory', i);
+    if (consumedMap) {
+      const c = consumedMap[`Memory:${m.name}`];
+      if (c) cap = Math.max(0, cap - c.count);
+    }
+    limits.memories.push(cap);
+  });
   return limits;
 }
 
@@ -592,7 +625,7 @@ function buildHumanTable() {
   wrap.querySelectorAll('.btn-del-row[data-type="human"]').forEach(btn => {
     btn.addEventListener('click', () => {
       humans.splice(parseInt(btn.dataset.index), 1);
-      buildHumanTable(); rebuildDropdown();
+      buildHumanTable(); rebuildDropdown(); clearBatchSelections();
     });
   });
 }
@@ -855,6 +888,7 @@ function uploadHumansCSV(text) {
   document.getElementById('solve-btn').disabled = true;
   document.getElementById('requirements-panel').classList.add('hidden');
   buildEditTables();
+  clearBatchSelections();
   showToast(`Loaded ${humans.length} professions`);
 }
 
@@ -925,7 +959,11 @@ function buildItems() {
   });
 }
 
-function startSolve() {
+// consumedMap (optional): shared-inventory tally from earlier humans in a batch run
+// (see getResourceLimits). Returns a Promise resolving with {solution, itemsSnapshot}
+// once the solve fully finishes (via finishSolve) — callers that don't need this
+// (the Solve button, Enter key) simply ignore the returned promise, unchanged from before.
+function startSolve(consumedMap) {
   if (currentTarget === null) return;
   const target = humans[currentTarget];
 
@@ -988,7 +1026,7 @@ function startSolve() {
   });
 
   // Resource limits — must match sorted items order
-  const limits = getResourceLimits();
+  const limits = getResourceLimits(consumedMap);
   const maxCounts = items.map(it => {
     if (it.kind === 'Food') {
       const fi = foods.findIndex(f => f.name === it.name);
@@ -1080,61 +1118,65 @@ function startSolve() {
   // If all workers ended up with no first items the problem is infeasible with this inventory
   if (wi === 0) { showToast('No usable items with current inventory — all counts are 0'); return; }
 
-  // UI state
-  solving = true;
-  paused = false;
-  totalPausedMs = 0;
-  globalBest = null;
-  allSolutions = [];
-  solutionIndex = 0;
-  userBrowsingSolutions = false;
-  ecoModeValue  = pendingEcoMode; // committed from the value read at the top of startSolve
-  ecoModeActive = ecoModeValue > 0;
-  cancelledByUser = false;
-  workerNodes = new Array(numWorkers).fill(0);
-  workerDepths = new Array(numWorkers).fill(0);
-  maxDepthReached = 0;
-  workersDone = 0;
-  workersExhaustive = 0;
-  document.getElementById('solve-btn').classList.add('hidden');
-  document.getElementById('cancel-btn').classList.remove('hidden');
-  document.getElementById('pause-btn').classList.remove('hidden');
-  document.getElementById('pause-btn').textContent = 'Pause';
-  document.getElementById('progress-card').classList.remove('hidden');
-  document.getElementById('results-card').classList.add('hidden');
-  document.getElementById('progress-bar').style.width = '0%';
-  document.getElementById('progress-best').textContent = '';
-  solveStart = performance.now();
+  return new Promise((resolve) => {
+    _solveCompletionResolve = resolve;
 
-  // Start progress timer
-  solveTimer = setInterval(updateProgress, 200);
+    // UI state
+    solving = true;
+    paused = false;
+    totalPausedMs = 0;
+    globalBest = null;
+    allSolutions = [];
+    solutionIndex = 0;
+    userBrowsingSolutions = false;
+    ecoModeValue  = pendingEcoMode; // committed from the value read at the top of startSolve
+    ecoModeActive = ecoModeValue > 0;
+    cancelledByUser = false;
+    workerNodes = new Array(numWorkers).fill(0);
+    workerDepths = new Array(numWorkers).fill(0);
+    maxDepthReached = 0;
+    workersDone = 0;
+    workersExhaustive = 0;
+    document.getElementById('solve-btn').classList.add('hidden');
+    document.getElementById('cancel-btn').classList.remove('hidden');
+    document.getElementById('pause-btn').classList.remove('hidden');
+    document.getElementById('pause-btn').textContent = 'Pause';
+    document.getElementById('progress-card').classList.remove('hidden');
+    document.getElementById('results-card').classList.add('hidden');
+    document.getElementById('progress-bar').style.width = '0%';
+    document.getElementById('progress-best').textContent = '';
+    solveStart = performance.now();
 
-  // Spawn workers
-  workers = [];
-  for (let w = 0; w < numWorkers; w++) {
-    const worker = new Worker('solver-worker.js');
-    worker.onmessage = ((idx) => (e) => handleWorkerMsg(idx, e.data))(w);
-    worker.onerror = () => {
-      workersDone++;
-      if (workersDone >= numWorkers) finishSolve();
-    };
-    worker.postMessage({
-      type: 'solve',
-      items: itemStatsForWorker,
-      humans: humanStatsForWorker,
-      targetReqs,
-      bestPerStat,
-      inherentCount,
-      firstItems: workerChunks[w],
-      initialLb,
-      maxSearchDepth,
-      maxCounts,
-      timeoutSec,
-      ecoMode: ecoModeActive,
-      availability: availabilityForWorker,
-    });
-    workers.push(worker);
-  }
+    // Start progress timer
+    solveTimer = setInterval(updateProgress, 200);
+
+    // Spawn workers
+    workers = [];
+    for (let w = 0; w < numWorkers; w++) {
+      const worker = new Worker('solver-worker.js');
+      worker.onmessage = ((idx) => (e) => handleWorkerMsg(idx, e.data))(w);
+      worker.onerror = () => {
+        workersDone++;
+        if (workersDone >= numWorkers) finishSolve();
+      };
+      worker.postMessage({
+        type: 'solve',
+        items: itemStatsForWorker,
+        humans: humanStatsForWorker,
+        targetReqs,
+        bestPerStat,
+        inherentCount,
+        firstItems: workerChunks[w],
+        initialLb,
+        maxSearchDepth,
+        maxCounts,
+        timeoutSec,
+        ecoMode: ecoModeActive,
+        availability: availabilityForWorker,
+      });
+      workers.push(worker);
+    }
+  });
 }
 
 // Rank one worker solution against another using the same objective order as the
@@ -1272,6 +1314,14 @@ function finishSolve() {
     globalBest = allSolutions[solutionIndex];
   }
   displayResults(elapsed, true);
+
+  if (_solveCompletionResolve) {
+    const resolve = _solveCompletionResolve;
+    _solveCompletionResolve = null;
+    // items may be rebuilt/filtered by the next solve — snapshot it now so batch
+    // callers can still map this solution's item indices back to names/kinds later.
+    resolve({ solution: globalBest, itemsSnapshot: items.slice() });
+  }
 }
 
 function updateProgress() {
@@ -1665,6 +1715,217 @@ function setupTabs() {
   });
 }
 
+// ─── Batch Mode ──────────────────────────────────────────────────────────────
+// Plans a recipe for several humans at once (each picking its own profession from
+// the existing, uneditable profession data) and merges the results into one
+// combined shopping list. Humans are solved strictly sequentially, each against a
+// shrinking shared inventory snapshot (batchConsumed), so a rare memory used by
+// human 1 is correctly unavailable to human 2 — the combined list can never imply
+// more of an item exists than actually does.
+
+function clearBatchSelections() {
+  if (batchProfessions.some(x => x != null)) {
+    batchProfessions = batchProfessions.map(() => null);
+    renderBatchSlots();
+  }
+}
+
+function renderBatchSlots() {
+  const container = document.getElementById('batch-slots');
+  if (!container) return;
+  container.innerHTML = '';
+  for (let i = 0; i < batchCount; i++) {
+    const row = document.createElement('div');
+    row.className = 'batch-slot';
+    row.dataset.slot = String(i);
+    row.innerHTML = `
+      <div class="batch-slot-header">
+        <span class="batch-slot-label">Human ${i + 1}</span>
+        <span class="batch-slot-status" data-status="pending"></span>
+      </div>
+      <select class="batch-prof-select" data-slot="${i}">
+        <option value="">Choose a profession&hellip;</option>
+      </select>
+    `;
+    container.appendChild(row);
+    const sel = row.querySelector('.batch-prof-select');
+    buildProfessionOptionsInto(sel);
+    if (batchProfessions[i] != null) sel.value = String(batchProfessions[i]);
+    sel.addEventListener('change', () => {
+      batchProfessions[i] = sel.value === '' ? null : parseInt(sel.value);
+    });
+  }
+}
+
+function onBatchCountChange() {
+  const input = document.getElementById('batch-count-input');
+  let n = parseInt(input.value) || 4;
+  n = Math.max(1, Math.min(12, n));
+  input.value = n;
+  batchCount = n;
+  batchProfessions = batchProfessions.slice(0, n);
+  while (batchProfessions.length < n) batchProfessions.push(null);
+  renderBatchSlots();
+}
+
+function toggleBatchMode() {
+  batchMode = document.getElementById('batch-mode-check').checked;
+  document.getElementById('single-target-panel').classList.toggle('hidden', batchMode);
+  document.getElementById('batch-panel').classList.toggle('hidden', !batchMode);
+  document.getElementById('solve-btn').classList.toggle('hidden', batchMode);
+  document.getElementById('batch-solve-btn').classList.toggle('hidden', !batchMode);
+  if (batchMode) {
+    document.getElementById('results-card').classList.add('hidden');
+    document.getElementById('apply-solution-wrap').classList.add('hidden');
+  } else {
+    document.getElementById('batch-results-card').classList.add('hidden');
+  }
+}
+
+function renderBatchSlotStatuses() {
+  const labels = { pending: '', solving: 'Solving…', solved: '✓ Solved', infeasible: '✗ Infeasible', cancelled: 'Cancelled' };
+  batchResultsData.forEach(entry => {
+    const pill = document.querySelector(`.batch-slot[data-slot="${entry.slotIndex}"] .batch-slot-status`);
+    if (!pill) return;
+    pill.dataset.status = entry.status;
+    pill.textContent = labels[entry.status] || '';
+  });
+}
+
+async function startBatchSolve() {
+  if (batchRunning || solving) return;
+  const activeIndices = [];
+  for (let i = 0; i < batchCount; i++) {
+    if (batchProfessions[i] != null) activeIndices.push(i);
+  }
+  if (activeIndices.length === 0) { showToast('Pick a profession for at least one human'); return; }
+
+  batchRunning = true;
+  batchCancelRequested = false;
+  batchConsumed = {};
+  batchResultsData = activeIndices.map(i => ({ slotIndex: i, professionIndex: batchProfessions[i], status: 'pending', html: '' }));
+  renderBatchSlotStatuses();
+
+  const savedCurrentTarget = currentTarget;
+  document.getElementById('batch-solve-btn').classList.add('hidden');
+  document.getElementById('batch-cancel-btn').classList.remove('hidden');
+  document.getElementById('batch-results-card').classList.add('hidden');
+  const progressLabel = document.getElementById('batch-progress-label');
+  progressLabel.classList.remove('hidden');
+
+  for (let n = 0; n < batchResultsData.length; n++) {
+    const entry = batchResultsData[n];
+    if (batchCancelRequested) { entry.status = 'cancelled'; renderBatchSlotStatuses(); continue; }
+    entry.status = 'solving';
+    renderBatchSlotStatuses();
+    const h = humans[entry.professionIndex];
+    progressLabel.textContent = `Solving Human ${entry.slotIndex + 1} of ${batchCount} — ${h.profession}…`;
+    currentTarget = entry.professionIndex;
+
+    const result = await startSolve(batchConsumed);
+    // startSolve()/finishSolve() reuse the single-target UI (progress card, results
+    // card, solve/apply buttons) — force them back into "batch is driving" state
+    // after every slot so they don't leak into view between/after solves.
+    document.getElementById('solve-btn').classList.add('hidden');
+    document.getElementById('apply-solution-wrap').classList.add('hidden');
+
+    if (!result || !result.solution) {
+      entry.status = 'infeasible';
+    } else {
+      entry.status = 'solved';
+      entry.html = document.getElementById('results-body').innerHTML;
+      result.solution.items.forEach(idx => {
+        const it = result.itemsSnapshot[idx];
+        const key = `${it.kind}:${it.name}`;
+        if (!batchConsumed[key]) batchConsumed[key] = { kind: it.kind, name: it.name, count: 0 };
+        batchConsumed[key].count++;
+      });
+    }
+    renderBatchSlotStatuses();
+  }
+
+  currentTarget = savedCurrentTarget;
+  batchRunning = false;
+  document.getElementById('batch-solve-btn').classList.remove('hidden');
+  document.getElementById('batch-cancel-btn').classList.add('hidden');
+  progressLabel.classList.add('hidden');
+  renderBatchResults();
+}
+
+function cancelBatchSolve() {
+  batchCancelRequested = true;
+  if (solving) cancelSolve();
+}
+
+function renderBatchResults() {
+  const card = document.getElementById('batch-results-card');
+  card.classList.remove('hidden');
+
+  const combined = Object.values(batchConsumed).map(c => {
+    const list = c.kind === 'Food' ? foods : memories;
+    const item = list.find(x => x.name === c.name);
+    return { name: c.name, kind: c.kind, count: c.count, availability: item ? (item.availability || 0) : 0 };
+  });
+  const foodItems = combined.filter(c => c.kind === 'Food').sort((a, b) => a.name.localeCompare(b.name));
+  const memItems = combined.filter(c => c.kind === 'Memory').sort((a, b) => a.name.localeCompare(b.name));
+
+  let html = '';
+  if (combined.length === 0) {
+    html = `<div class="info-box">No items required &mdash; see the per-human results below.</div>`;
+  } else {
+    if (foodItems.length > 0) {
+      html += `<div class="result-section">
+        <div class="result-section-title">Foods (${foodItems.reduce((a, c) => a + c.count, 0)} items)</div>
+        <div class="recipe-items">${foodItems.map(c => recipeItemHTML(c)).join('')}</div></div>`;
+    }
+    if (memItems.length > 0) {
+      html += `<div class="result-section">
+        <div class="result-section-title">Memories (${memItems.reduce((a, c) => a + c.count, 0)} items)</div>
+        <div class="recipe-items">${memItems.map(c => recipeItemHTML(c)).join('')}</div></div>`;
+    }
+  }
+  document.getElementById('batch-combined-section').innerHTML = html;
+
+  // Memories are always finite, so an apply option is worthwhile even in unlimited
+  // mode; food only warrants it once inventory is actually being tracked.
+  const unlimited = document.getElementById('unlimited-check').checked;
+  document.getElementById('batch-apply-wrap').classList.toggle('hidden', combined.length === 0 || (unlimited && memItems.length === 0));
+
+  let perHumanHtml = '';
+  batchResultsData.forEach(entry => {
+    const h = humans[entry.professionIndex];
+    const statusLabel = entry.status === 'infeasible' ? ' — No solution found'
+      : entry.status === 'cancelled' ? ' — Cancelled' : '';
+    perHumanHtml += `<div class="batch-result-item">
+      <button class="batch-result-toggle" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+        <span class="avoidable-toggle-icon">▶</span> Human ${entry.slotIndex + 1} &mdash; ${esc(h.profession)}${statusLabel}
+      </button>
+      <div class="batch-result-body collapsed">${entry.html || ''}</div>
+    </div>`;
+  });
+  document.getElementById('batch-per-human-section').innerHTML = perHumanHtml;
+
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function applyBatchSolution() {
+  const unlimited = document.getElementById('unlimited-check').checked;
+  for (const c of Object.values(batchConsumed)) {
+    if (unlimited && c.kind === 'Food') continue; // food stays infinite in unlimited mode
+    const list = c.kind === 'Food' ? foods : memories;
+    const datakind = c.kind === 'Food' ? 'food' : 'memory';
+    const idx = list.findIndex(x => x.name === c.name);
+    if (idx < 0) continue;
+    const inp = document.querySelector(`.inv-item-input[data-kind="${datakind}"][data-index="${idx}"]`);
+    if (!inp) continue;
+    const cur = inp.value === '' ? (list[idx].availability || 0) : (parseInt(inp.value) || 0);
+    inp.value = String(Math.max(0, cur - c.count));
+  }
+  document.getElementById('batch-apply-wrap').classList.add('hidden');
+  persistInventory();
+  showToast('Batch resources subtracted from inventory');
+}
+
 // ─── Init ────────────────────────────────────────────────────────────────────
 async function init() {
   try {
@@ -1677,12 +1938,19 @@ async function init() {
   populateDropdown();
   buildInventory();
   buildEditTables();
+  batchProfessions = new Array(batchCount).fill(null);
+  renderBatchSlots();
 
   // Event listeners
   initCombobox();
-  document.getElementById('solve-btn').addEventListener('click', startSolve);
+  document.getElementById('solve-btn').addEventListener('click', () => startSolve());
   document.getElementById('cancel-btn').addEventListener('click', cancelSolve);
   document.getElementById('pause-btn').addEventListener('click', togglePause);
+  document.getElementById('batch-mode-check').addEventListener('change', toggleBatchMode);
+  document.getElementById('batch-count-input').addEventListener('change', onBatchCountChange);
+  document.getElementById('batch-solve-btn').addEventListener('click', startBatchSolve);
+  document.getElementById('batch-cancel-btn').addEventListener('click', cancelBatchSolve);
+  document.getElementById('batch-apply-btn').addEventListener('click', applyBatchSolution);
   document.getElementById('unlimited-check').addEventListener('change', () => {
     toggleUnlimited();
     persistInventory();
@@ -1714,9 +1982,9 @@ async function init() {
     btn.addEventListener('click', () => setEcoMode(parseInt(btn.dataset.mode)));
   });
 
-  // Keyboard: Enter triggers solve
+  // Keyboard: Enter triggers solve (single-target mode only — batch mode has its own button)
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.target.matches('input, select, textarea') && !solving && currentTarget !== null) {
+    if (e.key === 'Enter' && !e.target.matches('input, select, textarea') && !solving && !batchMode && currentTarget !== null) {
       startSolve();
     }
   });

@@ -90,6 +90,40 @@ a:hover { text-decoration: underline; }
 /* Hidden utility */
 .hidden { display: none !important; }
 
+/* === Batch Mode === */
+.profession-card-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.batch-count-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.batch-count-row label { font-size: .88rem; color: var(--text-dim); }
+.batch-slots { display: flex; flex-direction: column; gap: 10px; }
+.batch-slot {
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 14px;
+}
+.batch-slot-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.batch-slot-label { font-weight: 600; color: var(--text-bright); font-size: .9rem; }
+.batch-slot-status { font-size: .78rem; color: var(--text-dim); }
+.batch-slot-status[data-status="solving"] { color: var(--accent); }
+.batch-slot-status[data-status="solved"] { color: var(--green); }
+.batch-slot-status[data-status="infeasible"] { color: var(--red); }
+.batch-slot-status[data-status="cancelled"] { color: var(--yellow); }
+.batch-prof-select {
+  width: 100%; padding: 9px 12px; font-size: .95rem;
+  background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.batch-prof-select:focus { outline: none; border-color: var(--accent); }
+.batch-progress-label { text-align: center; margin-top: -8px; }
+.batch-per-human-section { margin-top: 18px; }
+.batch-result-item + .batch-result-item { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.batch-result-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  background: none; border: none; color: var(--text-bright);
+  font-size: .92rem; font-weight: 600; cursor: pointer; padding: 4px 0;
+}
+.batch-result-toggle:hover { color: var(--accent); }
+.batch-result-body.collapsed { display: none; }
+.batch-result-body { margin-top: 8px; padding-left: 18px; }
+
 /* === Profession Combobox === */
 .prof-combo { position: relative; }
 .prof-combo-input {

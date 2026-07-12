@@ -45,36 +45,51 @@
 
       <!-- Profession Selection -->
       <section class="card" id="profession-card">
-        <div class="card-header">
+        <div class="card-header profession-card-header">
           <h2>Select Target Profession</h2>
+          <label class="checkbox-label" id="batch-mode-wrap" title="Plan a recipe for several humans at once and get one combined shopping list to cook them all together.">
+            <input type="checkbox" id="batch-mode-check">
+            <span>Batch Mode</span>
+          </label>
         </div>
         <div class="card-body">
-          <div class="prof-combo" id="profession-combo">
-            <input type="text" id="profession-filter" class="prof-combo-input"
-                   placeholder="Choose a profession…" autocomplete="off" spellcheck="false">
-            <span class="prof-combo-chevron" aria-hidden="true"></span>
-            <div class="prof-combo-dropdown" id="profession-dropdown" hidden></div>
-          </div>
-          <select id="profession-select" aria-hidden="true" tabindex="-1" style="display:none">
-            <option value="">Choose a profession&hellip;</option>
-          </select>
-
-          <div id="requirements-panel" class="requirements-panel hidden">
-            <h3 id="req-title" class="req-title"></h3>
-            <p class="req-hint">Values = stats that food &amp; memories must <strong>meet or exceed</strong>. Click a value to edit.</p>
-            <div id="req-grid" class="req-grid"></div>
-            <div id="analysis-panel" class="analysis-panel hidden">
-              <h4>Profession Analysis</h4>
-              <div class="info-box" id="match-info">
-                <strong>Why multiple professions?</strong>
-                When the accumulated stats from a recipe exceed the requirements of more than one profession, multiple matches occur.
-                Professions whose requirements are a strict subset of your target will <em>always</em> match (inherent).
-                It is currently unclear which profession the game selects when multiple match &mdash; it may be random.
-                The solver minimises these collateral matches so you get the best odds.
-              </div>
-              <div id="analysis-inherent" class="analysis-section"></div>
-              <div id="analysis-avoidable" class="analysis-section"></div>
+          <div id="single-target-panel">
+            <div class="prof-combo" id="profession-combo">
+              <input type="text" id="profession-filter" class="prof-combo-input"
+                     placeholder="Choose a profession…" autocomplete="off" spellcheck="false">
+              <span class="prof-combo-chevron" aria-hidden="true"></span>
+              <div class="prof-combo-dropdown" id="profession-dropdown" hidden></div>
             </div>
+            <select id="profession-select" aria-hidden="true" tabindex="-1" style="display:none">
+              <option value="">Choose a profession&hellip;</option>
+            </select>
+
+            <div id="requirements-panel" class="requirements-panel hidden">
+              <h3 id="req-title" class="req-title"></h3>
+              <p class="req-hint">Values = stats that food &amp; memories must <strong>meet or exceed</strong>. Click a value to edit.</p>
+              <div id="req-grid" class="req-grid"></div>
+              <div id="analysis-panel" class="analysis-panel hidden">
+                <h4>Profession Analysis</h4>
+                <div class="info-box" id="match-info">
+                  <strong>Why multiple professions?</strong>
+                  When the accumulated stats from a recipe exceed the requirements of more than one profession, multiple matches occur.
+                  Professions whose requirements are a strict subset of your target will <em>always</em> match (inherent).
+                  It is currently unclear which profession the game selects when multiple match &mdash; it may be random.
+                  The solver minimises these collateral matches so you get the best odds.
+                </div>
+                <div id="analysis-inherent" class="analysis-section"></div>
+                <div id="analysis-avoidable" class="analysis-section"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="batch-panel" class="hidden">
+            <div class="batch-count-row">
+              <label for="batch-count-input">Humans:</label>
+              <input type="number" id="batch-count-input" min="1" max="12" value="4" class="input-sm">
+              <span class="hint">Each picks its own profession. Solved in order shown &mdash; earlier humans get first pick of any limited/rare items.</span>
+            </div>
+            <div id="batch-slots" class="batch-slots"></div>
           </div>
         </div>
       </section>
@@ -202,9 +217,13 @@
       <!-- Solve Button -->
       <div class="solve-container">
         <button id="solve-btn" class="btn btn-solve" disabled>Find Optimal Recipe</button>
+        <button id="batch-solve-btn" class="btn btn-solve hidden">Solve Batch</button>
         <button id="pause-btn" class="btn btn-pause hidden">Pause</button>
         <button id="cancel-btn" class="btn btn-cancel hidden">Cancel</button>
+        <button id="batch-cancel-btn" class="btn btn-cancel hidden">Cancel Batch</button>
       </div>
+
+      <div class="hint batch-progress-label hidden" id="batch-progress-label"></div>
 
       <!-- Progress -->
       <section class="card hidden" id="progress-card">
@@ -236,6 +255,19 @@
         <div class="card-body hidden" id="apply-solution-wrap">
           <button class="btn btn-apply" id="apply-solution-btn">Apply Solution &mdash; Subtract Used Resources</button>
           <p class="hint">Subtracts recipe items from your inventory counts. Only available when not using unlimited resources.</p>
+        </div>
+      </section>
+
+      <!-- Batch Results -->
+      <section class="card hidden" id="batch-results-card">
+        <div class="card-header"><h2>Batch Recipe &mdash; Combined Shopping List</h2></div>
+        <div class="card-body">
+          <div id="batch-combined-section"></div>
+          <div class="card-body hidden" id="batch-apply-wrap" style="padding-left:0;padding-right:0;padding-bottom:0">
+            <button class="btn btn-apply" id="batch-apply-btn">Apply Batch &mdash; Subtract All Used Resources</button>
+            <p class="hint">Subtracts the combined batch totals from your inventory counts.</p>
+          </div>
+          <div id="batch-per-human-section" class="batch-per-human-section"></div>
         </div>
       </section>
 

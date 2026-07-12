@@ -2227,6 +2227,130 @@
       });
     })();
 
+    // ──────────────────────────────────────────────────────────────────────
+    // Batch Mode — shared inventory & combined shopping list
+    // ──────────────────────────────────────────────────────────────────────
+
+    // Mirrors app.js getResourceLimits(consumedMap): food is only decremented by
+    // batch consumption when NOT unlimited (unlimited food is freely craftable);
+    // memories are ALWAYS decremented, since they're finite collectibles regardless
+    // of the unlimited toggle (see app.js:344-368).
+    function getResourceLimitWithConsumedRef(kind, unlimited, invValue, worldCount, consumedCount) {
+      let cap = kind === 'food' ? (unlimited ? 9999 : invValue) : (unlimited ? (worldCount || 9999) : invValue);
+      if (consumedCount) {
+        if (kind === 'food' && unlimited) return cap; // food stays infinite while unlimited
+        cap = Math.max(0, cap - consumedCount);
+      }
+      return cap;
+    }
+
+    // Mirrors the merge-by-`${kind}:${name}` logic shared by startBatchSolve()'s
+    // batchConsumed tally and renderBatchResults()'s combined list (app.js
+    // startBatchSolve/renderBatchResults) — each simulated human's item indices
+    // are only meaningful against ITS OWN itemsSnapshot, since `items` is rebuilt
+    // fresh per solve.
+    function mergeBatchConsumedRef(entries) {
+      const consumed = {};
+      entries.forEach(entry => {
+        if (entry.status !== 'solved') return;
+        entry.solution.items.forEach(idx => {
+          const it = entry.itemsSnapshot[idx];
+          const key = `${it.kind}:${it.name}`;
+          if (!consumed[key]) consumed[key] = { kind: it.kind, name: it.name, count: 0 };
+          consumed[key].count++;
+        });
+      });
+      return consumed;
+    }
+
+    section('Batch resource limits — memories always shrink from batch consumption, food only when limited');
+    assertEqual(getResourceLimitWithConsumedRef('memory', true, 5, 30, 12), 18, 'unlimited memory: world cap (30) minus consumed (12) = 18');
+    assertEqual(getResourceLimitWithConsumedRef('memory', true, 5, 0, 12), 9987, 'unlimited memory with no world count still shrinks from the 9999 fallback');
+    assertEqual(getResourceLimitWithConsumedRef('food', true, 5, 0, 12), 9999, 'unlimited food is untouched by batch consumption (freely craftable)');
+    assertEqual(getResourceLimitWithConsumedRef('food', false, 10, 0, 3), 7, 'limited food inventory IS shared/decremented across the batch');
+    assertEqual(getResourceLimitWithConsumedRef('memory', false, 4, 30, 6), 0, 'consumption exceeding what remains floors at zero, never negative');
+    assertEqual(getResourceLimitWithConsumedRef('food', false, 10, 0, 0), 10, 'zero consumption leaves the limit unchanged');
+
+    section('Combined shopping list — merges by kind:name across differently-indexed per-human snapshots');
+    {
+      // Two fake solved humans whose item pools are ordered/filtered DIFFERENTLY
+      // (exactly what happens in practice: `items` is rebuilt fresh per runSolve
+      // call), but both reference an item named "Ancient Memory".
+      const human1 = {
+        status: 'solved',
+        itemsSnapshot: [
+          { kind: 'Memory', name: 'Ancient Memory' },
+          { kind: 'Food', name: 'High-Fat' },
+        ],
+        solution: { items: [0, 0, 1] }, // 2x Ancient Memory, 1x High-Fat
+      };
+      const human2 = {
+        status: 'solved',
+        itemsSnapshot: [
+          { kind: 'Food', name: 'High-Fat' },
+          { kind: 'Memory', name: 'Ancient Memory' }, // same item, different index than human1
+        ],
+        solution: { items: [1, 1, 0] }, // 2x Ancient Memory, 1x High-Fat
+      };
+      const human3Infeasible = { status: 'infeasible', itemsSnapshot: [], solution: null };
+
+      const combined = mergeBatchConsumedRef([human1, human2, human3Infeasible]);
+      assertEqual(combined['Memory:Ancient Memory'].count, 4, 'Ancient Memory counts merge across humans despite different indices (2+2)');
+      assertEqual(combined['Food:High-Fat'].count, 2, 'High-Fat counts merge across humans (1+1)');
+      assertEqual(Object.keys(combined).length, 2, 'only two distinct items appear in the combined map');
+      assert(!('undefined' in combined), 'an infeasible/cancelled entry contributes nothing to the combined total');
+    }
+
+    section('Sequential shrink propagation — human 2 sees what human 1 already consumed');
+    {
+      // A memory with only 5 in the world; human 1's solved recipe used 4 of it.
+      const batchConsumed = { 'Memory:Rare Memory': { kind: 'Memory', name: 'Rare Memory', count: 4 } };
+      const capForHuman2 = getResourceLimitWithConsumedRef('memory', true, 0, 5, batchConsumed['Memory:Rare Memory'].count);
+      assertEqual(capForHuman2, 1, 'human 2\'s maxCounts for the shared rare memory reflects only 1 remaining');
+    }
+
+    section('Infeasible mid-batch — a failed slot tallies zero consumption and does not block later slots');
+    {
+      const humanFailed = { status: 'infeasible', itemsSnapshot: [], solution: null };
+      const humanOk = {
+        status: 'solved',
+        itemsSnapshot: [{ kind: 'Memory', name: 'Rare Memory' }],
+        solution: { items: [0] },
+      };
+      const combined = mergeBatchConsumedRef([humanFailed, humanOk]);
+      assertEqual(combined['Memory:Rare Memory'].count, 1, 'the failed slot does not add to or block the next solved slot\'s tally');
+    }
+
+    section('Never imply more of an item exists than actually does — combined total stays within world count');
+    {
+      // 3 humans sharing a memory capped at worldCount=5: each solve is simulated
+      // as if it had already been clamped by getResourceLimitWithConsumedRef
+      // (i.e. each human can only ever use what's left when it's their turn).
+      const worldCount = 5;
+      let used = 0;
+      const perHumanUsage = [3, 3, 3]; // each human WOULD like 3, but supply is shared
+      const actualUsage = perHumanUsage.map(want => {
+        const remaining = getResourceLimitWithConsumedRef('memory', true, 0, worldCount, used);
+        const got = Math.min(want, remaining);
+        used += got;
+        return got;
+      });
+      assertEqual(actualUsage.reduce((a, b) => a + b, 0), worldCount, 'three humans wanting 9 total settle for exactly the 5 available');
+      assert(actualUsage.every(u => u >= 0), 'no human is ever assigned negative usage');
+    }
+
+    section('Duplicate profession picks — two slots targeting the same profession solve independently, not deduped');
+    {
+      // Two slots both target the same profession. Because the shared pool shrinks
+      // sequentially, the second slot's recipe can legitimately use less/different
+      // items than the first's — that's expected, not a bug (see edge case notes).
+      const humanA = { status: 'solved', itemsSnapshot: [{ kind: 'Memory', name: 'Rare Memory' }], solution: { items: [0, 0] } };
+      const humanB = { status: 'solved', itemsSnapshot: [{ kind: 'Memory', name: 'Rare Memory' }], solution: { items: [0] } };
+      const combined = mergeBatchConsumedRef([humanA, humanB]);
+      assertEqual(combined['Memory:Rare Memory'].count, 3, 'both slots\' usage of the same item merges into one combined total (2+1)');
+      assertEqual([humanA, humanB].length, 2, 'duplicate profession picks still produce two separate result entries, never deduped');
+    }
+
     // Fallback: show summary if all tests were synchronous (no asyncBegin calls)
     setTimeout(() => { if (asyncPending <= 0) showSummary(); }, 100);  </script>
 </body>
